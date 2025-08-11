@@ -241,6 +241,108 @@ class Particle {
     }
 }
 
+// Projectile class for AI abilities
+class Projectile {
+    constructor(x, y, targetX, targetY, speed = 8) {
+        this.x = x;
+        this.y = y;
+        this.radius = 8;
+        this.speed = speed;
+        this.life = 1.0;
+        this.maxLife = 3.0; // 3 seconds
+        
+        // Calculate direction to target
+        const dx = targetX - x;
+        const dy = targetY - y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        
+        this.vx = (dx / dist) * speed;
+        this.vy = (dy / dist) * speed;
+        
+        this.trail = [];
+        this.color = '#ff6b6b';
+    }
+    
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.life -= 1/60; // Assuming 60 FPS
+        
+        // Update trail
+        this.trail.push({ x: this.x, y: this.y });
+        if (this.trail.length > 10) {
+            this.trail.shift();
+        }
+    }
+    
+    isExpired() {
+        return this.life <= 0;
+    }
+    
+    checkCollision(player) {
+        const dx = this.x - player.x;
+        const dy = this.y - player.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        return dist < this.radius + player.radius;
+    }
+    
+    draw(ctx) {
+        // Draw trail
+        if (this.trail.length > 1) {
+            ctx.strokeStyle = this.color + '40';
+            ctx.lineWidth = this.radius;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            
+            for (let i = 1; i < this.trail.length; i++) {
+                const alpha = i / this.trail.length;
+                ctx.globalAlpha = alpha * 0.5;
+                
+                if (i === 1) {
+                    ctx.moveTo(this.trail[i-1].x, this.trail[i-1].y);
+                }
+                ctx.lineTo(this.trail[i].x, this.trail[i].y);
+            }
+            
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+        }
+        
+        // Draw glow
+        const gradient = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, this.radius * 2);
+        gradient.addColorStop(0, this.color + '80');
+        gradient.addColorStop(1, this.color + '00');
+        
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius * 2, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Draw projectile
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Inner glow
+        const innerGradient = ctx.createRadialGradient(
+            this.x - this.radius/3, 
+            this.y - this.radius/3, 
+            0, 
+            this.x, 
+            this.y, 
+            this.radius
+        );
+        innerGradient.addColorStop(0, '#ffffff60');
+        innerGradient.addColorStop(1, this.color);
+        
+        ctx.fillStyle = innerGradient;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius * 0.8, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
 // Game class
 class Game {
     constructor() {
@@ -277,11 +379,32 @@ class Game {
             radius: 15,
             color: '#ff4a4a',
             trail: [],
-            speed: 3
+            speed: 3,
+            isDashing: false,
+            dashTime: 0,
+            dashDirection: { x: 0, y: 0 }
         };
         
-        // Neural network for AI (6 inputs: player pos, velocity, AI pos)
-        this.nn = new NeuralNetwork(6, 12, 2);
+        // AI Abilities
+        this.abilities = {
+            projectile: {
+                cooldown: 3000, // 3 seconds
+                lastUsed: 0,
+                range: 300
+            },
+            dash: {
+                cooldown: 5000, // 5 seconds
+                lastUsed: 0,
+                duration: 500, // 0.5 seconds
+                speed: 12
+            }
+        };
+        
+        // Projectiles array
+        this.projectiles = [];
+        
+        // Neural network for AI (8 inputs: player pos, velocity, AI pos, cooldown states)
+        this.nn = new NeuralNetwork(8, 16, 4); // 4 outputs: move_x, move_y, use_projectile, use_dash
         
         // Training data buffer
         this.trainingData = [];
@@ -336,9 +459,17 @@ class Game {
         this.player.y = this.canvas.height / 2;
         this.ai.x = this.canvas.width / 4;
         this.ai.y = this.canvas.height / 4;
+        this.ai.isDashing = false;
+        this.ai.dashTime = 0;
         
-        // Hide instructions
+        // Reset abilities
+        this.abilities.projectile.lastUsed = 0;
+        this.abilities.dash.lastUsed = 0;
+        this.projectiles = [];
+        
+        // Hide instructions and restore game cursor
         document.getElementById('instructions').classList.add('hidden');
+        this.canvas.classList.remove('game-over');
     }
     
     updatePlayer() {
@@ -377,6 +508,12 @@ class Game {
     }
     
     updateAI() {
+        const currentTime = Date.now();
+        
+        // Check ability cooldowns
+        const projectileReady = (currentTime - this.abilities.projectile.lastUsed) >= this.abilities.projectile.cooldown;
+        const dashReady = (currentTime - this.abilities.dash.lastUsed) >= this.abilities.dash.cooldown;
+        
         // Prepare inputs for neural network (normalized)
         const inputs = [
             this.player.x / this.canvas.width,
@@ -384,24 +521,56 @@ class Game {
             this.player.vx / 10,
             this.player.vy / 10,
             this.ai.x / this.canvas.width,
-            this.ai.y / this.canvas.height
+            this.ai.y / this.canvas.height,
+            projectileReady ? 1 : 0,
+            dashReady ? 1 : 0
         ];
         
         // Get AI prediction
         const outputs = this.nn.predict(inputs);
         
-        // Convert outputs to movement
-        const targetX = outputs[0] * this.canvas.width;
-        const targetY = outputs[1] * this.canvas.height;
+        // Convert outputs to actions
+        const moveX = (outputs[0] - 0.5) * 2; // -1 to 1
+        const moveY = (outputs[1] - 0.5) * 2; // -1 to 1
+        const useProjectile = outputs[2] > 0.7; // threshold for using projectile
+        const useDash = outputs[3] > 0.8; // threshold for using dash
         
-        // Move AI towards predicted position
-        const dx = targetX - this.ai.x;
-        const dy = targetY - this.ai.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        
-        if (dist > 0) {
-            this.ai.vx = (dx / dist) * this.ai.speed;
-            this.ai.vy = (dy / dist) * this.ai.speed;
+        // Handle dash ability
+        if (this.ai.isDashing) {
+            this.ai.dashTime -= 16; // assuming 60fps
+            if (this.ai.dashTime <= 0) {
+                this.ai.isDashing = false;
+            } else {
+                this.ai.vx = this.ai.dashDirection.x * this.abilities.dash.speed;
+                this.ai.vy = this.ai.dashDirection.y * this.abilities.dash.speed;
+                
+                // Create dash particles
+                for (let i = 0; i < 3; i++) {
+                    this.particles.push(new Particle(
+                        this.ai.x + (Math.random() - 0.5) * 20,
+                        this.ai.y + (Math.random() - 0.5) * 20,
+                        '#ffaa00',
+                        {
+                            x: (Math.random() - 0.5) * 8,
+                            y: (Math.random() - 0.5) * 8
+                        }
+                    ));
+                }
+            }
+        } else {
+            // Normal movement
+            const currentSpeed = this.ai.speed;
+            this.ai.vx = moveX * currentSpeed;
+            this.ai.vy = moveY * currentSpeed;
+            
+            // Use abilities based on neural network decision
+            if (useProjectile && projectileReady) {
+                this.useProjectile();
+            }
+            
+            if (useDash && dashReady && !this.ai.isDashing) {
+                this.useDash(moveX, moveY);
+            }
         }
         
         this.ai.x += this.ai.vx;
@@ -431,14 +600,25 @@ class Game {
         }
         
         // Collect training data
-        const futurePlayerX = this.player.x + this.player.vx * 10;
-        const futurePlayerY = this.player.y + this.player.vy * 10;
+        const futurePlayerX = this.player.x + this.player.vx * 15;
+        const futurePlayerY = this.player.y + this.player.vy * 15;
+        const distToPlayer = Math.sqrt(
+            (this.player.x - this.ai.x) ** 2 + (this.player.y - this.ai.y) ** 2
+        );
+        
+        // Calculate optimal actions for training
+        const optimalMoveX = Math.min(1, Math.max(-1, (futurePlayerX - this.ai.x) / 100));
+        const optimalMoveY = Math.min(1, Math.max(-1, (futurePlayerY - this.ai.y) / 100));
+        const shouldUseProjectile = distToPlayer < this.abilities.projectile.range && distToPlayer > 50 ? 0.9 : 0.1;
+        const shouldUseDash = distToPlayer > 150 && distToPlayer < 250 ? 0.9 : 0.1;
         
         this.trainingData.push({
             inputs: inputs,
             targets: [
-                futurePlayerX / this.canvas.width,
-                futurePlayerY / this.canvas.height
+                (optimalMoveX + 1) / 2, // normalize to 0-1
+                (optimalMoveY + 1) / 2, // normalize to 0-1
+                shouldUseProjectile,
+                shouldUseDash
             ]
         });
         
@@ -447,9 +627,9 @@ class Game {
         }
         
         // Train the network periodically
-        if (this.trainingData.length > 10 && Math.random() < 0.1) {
+        if (this.trainingData.length > 15 && Math.random() < 0.08) {
             let totalError = 0;
-            const sampleSize = Math.min(10, this.trainingData.length);
+            const sampleSize = Math.min(8, this.trainingData.length);
             
             for (let i = 0; i < sampleSize; i++) {
                 const data = this.trainingData[this.trainingData.length - 1 - i];
@@ -457,7 +637,72 @@ class Game {
                 totalError += error;
             }
             
-            this.aiAccuracy = Math.max(0, Math.min(100, 100 - (totalError / sampleSize) * 200));
+            this.aiAccuracy = Math.max(0, Math.min(100, 100 - (totalError / sampleSize) * 150));
+        }
+    }
+    
+    useProjectile() {
+        const currentTime = Date.now();
+        this.abilities.projectile.lastUsed = currentTime;
+        
+        // Predict where player will be
+        const futureX = this.player.x + this.player.vx * 20;
+        const futureY = this.player.y + this.player.vy * 20;
+        
+        this.projectiles.push(new Projectile(this.ai.x, this.ai.y, futureX, futureY));
+        
+        // Create muzzle flash effect
+        for (let i = 0; i < 8; i++) {
+            this.particles.push(new Particle(
+                this.ai.x,
+                this.ai.y,
+                '#ff6b6b',
+                {
+                    x: (Math.random() - 0.5) * 10,
+                    y: (Math.random() - 0.5) * 10
+                }
+            ));
+        }
+    }
+    
+    useDash(dirX, dirY) {
+        const currentTime = Date.now();
+        this.abilities.dash.lastUsed = currentTime;
+        this.ai.isDashing = true;
+        this.ai.dashTime = this.abilities.dash.duration;
+        
+        // Normalize direction
+        const length = Math.sqrt(dirX * dirX + dirY * dirY);
+        if (length > 0) {
+            this.ai.dashDirection.x = dirX / length;
+            this.ai.dashDirection.y = dirY / length;
+        } else {
+            // Default direction towards player
+            const dx = this.player.x - this.ai.x;
+            const dy = this.player.y - this.ai.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            this.ai.dashDirection.x = dx / dist;
+            this.ai.dashDirection.y = dy / dist;
+        }
+    }
+    
+    updateProjectiles() {
+        for (let i = this.projectiles.length - 1; i >= 0; i--) {
+            const projectile = this.projectiles[i];
+            projectile.update();
+            
+            // Check collision with player
+            if (projectile.checkCollision(this.player)) {
+                this.gameOver('Hit by projectile!');
+                return;
+            }
+            
+            // Check if projectile is out of bounds or expired
+            if (projectile.isExpired() || 
+                projectile.x < 0 || projectile.x > this.canvas.width ||
+                projectile.y < 0 || projectile.y > this.canvas.height) {
+                this.projectiles.splice(i, 1);
+            }
         }
     }
     
@@ -467,16 +712,66 @@ class Game {
         const dist = Math.sqrt(dx * dx + dy * dy);
         
         if (dist < this.player.radius + this.ai.radius) {
-            // Game over
-            this.isRunning = false;
-            document.getElementById('instructions').classList.remove('hidden');
-            document.getElementById('instructions').innerHTML = `
-                <h2>Game Over!</h2>
-                <p>Final Score: ${this.score}</p>
-                <p>AI Learning Progress: ${Math.round(this.aiAccuracy)}%</p>
-                <p>The AI learned your patterns!</p>
-                <button id="start-btn" onclick="game.start()">Play Again</button>
-            `;
+            this.gameOver('Caught by AI!');
+        }
+    }
+    
+    gameOver(reason) {
+        this.isRunning = false;
+        
+        // Show cursor when game ends
+        this.canvas.classList.add('game-over');
+        
+        document.getElementById('instructions').classList.remove('hidden');
+        document.getElementById('instructions').innerHTML = `
+            <h2>Game Over!</h2>
+            <p>${reason}</p>
+            <p>Final Score: ${Math.floor(this.score)}</p>
+            <p>AI Learning Progress: ${Math.round(this.aiAccuracy)}%</p>
+            <p>The AI learned your patterns!</p>
+            <button id="start-btn" onclick="game.start()">Play Again</button>
+        `;
+    }
+    
+    updateAbilityUI() {
+        const currentTime = Date.now();
+        
+        // Update projectile ability UI
+        const projectileSlot = document.getElementById('projectile-ability');
+        const projectileCooldownLeft = Math.max(0, this.abilities.projectile.cooldown - (currentTime - this.abilities.projectile.lastUsed));
+        const projectileProgress = (projectileCooldownLeft / this.abilities.projectile.cooldown) * 100;
+        
+        if (projectileCooldownLeft > 0) {
+            projectileSlot.classList.add('cooldown');
+            projectileSlot.classList.remove('active');
+            const overlay = projectileSlot.querySelector('.cooldown-overlay');
+            overlay.style.setProperty('--progress', `${projectileProgress}%`);
+            const timer = projectileSlot.querySelector('.cooldown-timer');
+            timer.textContent = Math.ceil(projectileCooldownLeft / 1000);
+        } else {
+            projectileSlot.classList.remove('cooldown');
+            projectileSlot.classList.add('active');
+            const timer = projectileSlot.querySelector('.cooldown-timer');
+            timer.textContent = '';
+        }
+        
+        // Update dash ability UI
+        const dashSlot = document.getElementById('dash-ability');
+        const dashCooldownLeft = Math.max(0, this.abilities.dash.cooldown - (currentTime - this.abilities.dash.lastUsed));
+        const dashProgress = (dashCooldownLeft / this.abilities.dash.cooldown) * 100;
+        
+        if (dashCooldownLeft > 0) {
+            dashSlot.classList.add('cooldown');
+            dashSlot.classList.remove('active');
+            const overlay = dashSlot.querySelector('.cooldown-overlay');
+            overlay.style.setProperty('--progress', `${dashProgress}%`);
+            const timer = dashSlot.querySelector('.cooldown-timer');
+            timer.textContent = Math.ceil(dashCooldownLeft / 1000);
+        } else {
+            dashSlot.classList.remove('cooldown');
+            dashSlot.classList.add('active');
+            const timer = dashSlot.querySelector('.cooldown-timer');
+            timer.textContent = '';
         }
     }
     
@@ -496,8 +791,10 @@ class Game {
         
         this.updatePlayer();
         this.updateAI();
+        this.updateProjectiles();
         this.checkCollision();
         this.updateParticles();
+        this.updateAbilityUI();
         
         // Update score
         this.score += deltaTime;
@@ -563,9 +860,40 @@ class Game {
         
         ctx.clearRect(0, 0, width, height);
         
-        // Draw network visualization
+        if (!this.isRunning) {
+            // Show static network when not running
+            ctx.fillStyle = '#333';
+            ctx.font = '12px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('Neural Network', width/2, height/2 - 10);
+            ctx.fillText('(Inactive)', width/2, height/2 + 10);
+            return;
+        }
+        
+        // Get current neural network state
+        const currentTime = Date.now();
+        const projectileReady = (currentTime - this.abilities.projectile.lastUsed) >= this.abilities.projectile.cooldown;
+        const dashReady = (currentTime - this.abilities.dash.lastUsed) >= this.abilities.dash.cooldown;
+        
+        const inputs = [
+            this.player.x / this.canvas.width,
+            this.player.y / this.canvas.height,
+            this.player.vx / 10,
+            this.player.vy / 10,
+            this.ai.x / this.canvas.width,
+            this.ai.y / this.canvas.height,
+            projectileReady ? 1 : 0,
+            dashReady ? 1 : 0
+        ];
+        
+        const outputs = this.nn.predict(inputs);
+        
+        // Draw network visualization with real-time data
         const layers = [this.nn.inputSize, this.nn.hiddenSize, this.nn.outputSize];
         const layerWidth = width / (layers.length + 1);
+        
+        const inputLabels = ['Px', 'Py', 'Vx', 'Vy', 'Ax', 'Ay', 'P?', 'D?'];
+        const outputLabels = ['Mx', 'My', 'Shoot', 'Dash'];
         
         for (let l = 0; l < layers.length; l++) {
             const x = layerWidth * (l + 1);
@@ -574,7 +902,15 @@ class Game {
             for (let n = 0; n < layers[l]; n++) {
                 const y = nodeHeight * (n + 1);
                 
-                // Draw connections to next layer
+                // Calculate node activation intensity
+                let activation = 0.5; // default for hidden layer
+                if (l === 0) {
+                    activation = Math.abs(inputs[n]); // input layer
+                } else if (l === layers.length - 1) {
+                    activation = outputs[n]; // output layer
+                }
+                
+                // Draw connections to next layer with varying intensity
                 if (l < layers.length - 1) {
                     const nextLayerX = layerWidth * (l + 2);
                     const nextNodeHeight = height / (layers[l + 1] + 1);
@@ -582,7 +918,13 @@ class Game {
                     for (let nn = 0; nn < layers[l + 1]; nn++) {
                         const nextY = nextNodeHeight * (nn + 1);
                         
-                        ctx.strokeStyle = '#ffffff10';
+                        // Connection strength based on weights (simplified visualization)
+                        const weight = l === 0 ? this.nn.weightsIH[nn][n] : this.nn.weightsHO[nn][n];
+                        const intensity = Math.min(1, Math.abs(weight) * activation);
+                        const alpha = Math.floor(intensity * 255).toString(16).padStart(2, '0');
+                        
+                        ctx.strokeStyle = weight > 0 ? `#4a9eff${alpha}` : `#ff4a4a${alpha}`;
+                        ctx.lineWidth = 1 + intensity;
                         ctx.beginPath();
                         ctx.moveTo(x, y);
                         ctx.lineTo(nextLayerX, nextY);
@@ -590,13 +932,55 @@ class Game {
                     }
                 }
                 
-                // Draw node
-                const nodeColor = l === 0 ? '#4a9eff' : l === layers.length - 1 ? '#ff4a4a' : '#666';
-                ctx.fillStyle = nodeColor;
+                // Draw node with activation-based intensity
+                const baseColor = l === 0 ? '#4a9eff' : l === layers.length - 1 ? '#ff4a4a' : '#888';
+                const intensity = Math.min(1, Math.max(0.2, activation));
+                const alpha = Math.floor(intensity * 255).toString(16).padStart(2, '0');
+                
+                // Node glow effect based on activation
+                if (intensity > 0.5) {
+                    ctx.fillStyle = baseColor + '40';
+                    ctx.beginPath();
+                    ctx.arc(x, y, 8, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                
+                ctx.fillStyle = baseColor + alpha;
                 ctx.beginPath();
                 ctx.arc(x, y, 4, 0, Math.PI * 2);
                 ctx.fill();
+                
+                // Draw labels for input and output nodes
+                ctx.fillStyle = '#fff';
+                ctx.font = '8px monospace';
+                ctx.textAlign = 'center';
+                
+                if (l === 0 && n < inputLabels.length) {
+                    ctx.fillText(inputLabels[n], x, y - 12);
+                } else if (l === layers.length - 1 && n < outputLabels.length) {
+                    ctx.fillText(outputLabels[n], x, y + 18);
+                    
+                    // Show output values
+                    const value = (outputs[n] * 100).toFixed(0);
+                    ctx.fillStyle = outputs[n] > 0.7 ? '#ffff00' : '#666';
+                    ctx.fillText(`${value}%`, x, y + 28);
+                }
             }
+        }
+        
+        // Draw real-time decision indicators
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'left';
+        
+        const decisions = [];
+        if (outputs[2] > 0.7) decisions.push('🎯 SHOOT');
+        if (outputs[3] > 0.8) decisions.push('⚡ DASH');
+        if (this.ai.isDashing) decisions.push('💨 DASHING');
+        
+        if (decisions.length > 0) {
+            ctx.fillStyle = '#ffff00';
+            ctx.fillText(decisions.join(' '), 5, height - 5);
         }
     }
     
@@ -628,19 +1012,30 @@ class Game {
         this.particles.forEach(particle => particle.draw(this.ctx));
         
         if (this.isRunning) {
+            // Draw projectiles
+            this.projectiles.forEach(projectile => projectile.draw(this.ctx));
+            
             // Draw AI prediction line
+            const currentTime = Date.now();
+            const projectileReady = (currentTime - this.abilities.projectile.lastUsed) >= this.abilities.projectile.cooldown;
+            const dashReady = (currentTime - this.abilities.dash.lastUsed) >= this.abilities.dash.cooldown;
+            
             const inputs = [
                 this.player.x / this.canvas.width,
                 this.player.y / this.canvas.height,
                 this.player.vx / 10,
                 this.player.vy / 10,
                 this.ai.x / this.canvas.width,
-                this.ai.y / this.canvas.height
+                this.ai.y / this.canvas.height,
+                projectileReady ? 1 : 0,
+                dashReady ? 1 : 0
             ];
             
             const outputs = this.nn.predict(inputs);
-            const predictX = outputs[0] * this.canvas.width;
-            const predictY = outputs[1] * this.canvas.height;
+            const moveX = (outputs[0] - 0.5) * 2;
+            const moveY = (outputs[1] - 0.5) * 2;
+            const predictX = this.ai.x + moveX * 50;
+            const predictY = this.ai.y + moveY * 50;
             
             this.ctx.strokeStyle = '#ff4a4a20';
             this.ctx.lineWidth = 2;
@@ -650,6 +1045,17 @@ class Game {
             this.ctx.lineTo(predictX, predictY);
             this.ctx.stroke();
             this.ctx.setLineDash([]);
+            
+            // Draw dash effect
+            if (this.ai.isDashing) {
+                this.ctx.strokeStyle = '#ffaa0080';
+                this.ctx.lineWidth = this.ai.radius * 2;
+                this.ctx.lineCap = 'round';
+                this.ctx.beginPath();
+                this.ctx.moveTo(this.ai.x - this.ai.vx, this.ai.y - this.ai.vy);
+                this.ctx.lineTo(this.ai.x, this.ai.y);
+                this.ctx.stroke();
+            }
             
             // Draw orbs
             this.drawOrb(this.player.x, this.player.y, this.player.radius, this.player.color, this.player.trail);
